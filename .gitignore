@@ -1,0 +1,9 @@
+# 会话与产物
+session.txt
+config.json
+data/
+*.log
+
+# Python
+__pycache__/
+*.pyc
