@@ -23,7 +23,8 @@ python src/vyce.py stats
 1. 浏览器登录 https://vyce.cloud（GitHub OAuth，账号需 ≥ 30 天）。
 2. DevTools → Network → 任一 `/api/` 请求 → 复制请求头里的整行 `Cookie:`，存成项目根目录 `session.txt`（单行）。
 3. 验证：`python src/vyce.py auth-check`
-4. 自动抢：
+4. 登记公钥（建机必需）：`python src/vyce.py key-add --pub ~/.ssh/id_ed25519.pub`
+5. 自动抢：
 
 ```bash
 python src/vyce.py watch --deploy          # 检测到名额即下单
@@ -39,6 +40,7 @@ python src/vyce.py watch --deploy --dry-run # 演练：只打印将要提交的�
 | `status` | 打印当前名额、各区域 `freeOpen`、账号/免费机数量 |
 | `watch [--interval 2] [--seconds N] [--deploy] [--dry-run]` | 轮询库存；状态翻转写 `data/stock.jsonl`，`--deploy` 时自动下单 |
 | `auth-check` | 验证 `session.txt` 的 Cookie 与账号资格（GitHub 龄、SSH key） |
+| `key-add [--pub PATH] [--name N]` | 把本地公钥登记到账号（建机前置） |
 | `deploy [--dry-run]` | 名额已开放时手动下单一次 |
 | `stats` | 汇总放号时段分布与最近记录 |
 

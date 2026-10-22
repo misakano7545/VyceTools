@@ -37,6 +37,24 @@ TZ = timezone(timedelta(hours=8))
 UA = "vyce-cloud-tool/0.1 (personal use, single account)"
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,22}[a-z0-9]$")
 
+# 站点 POST /api/servers 的 os 字段吃的是展示名（实测 400 才发现的坑），
+# 前端 state 用的也是 Kg[].name。这里做 id → 展示名映射，两者都接受。
+OS_OPTIONS = {
+    "ubuntu-24": "Ubuntu 24.04",
+    "ubuntu-22": "Ubuntu 22.04",
+    "debian-12": "Debian 12",
+    "fedora-41": "Fedora 41",
+    "alma-9": "AlmaLinux 9",
+}
+
+
+def resolve_os(value: str) -> str:
+    if value in OS_OPTIONS:
+        return OS_OPTIONS[value]
+    if value in OS_OPTIONS.values():
+        return value
+    die(f"os 不支持：{value}（可选 {', '.join(OS_OPTIONS)}）")
+
 DEFAULTS = {
     "base_url": "https://vyce.cloud",
     "poll_interval": 2.0,
@@ -133,6 +151,9 @@ class Api:
             req = urllib.request.Request(self.base + path, method=method)
             req.add_header("User-Agent", UA)
             req.add_header("Accept", "application/json")
+            # 站点的 CSRF 校验要求同源：带 Origin/Referer 才能通过 POST
+            req.add_header("Origin", self.base)
+            req.add_header("Referer", self.base + "/")
             if self.cookie:
                 req.add_header("Cookie", self.cookie)
             if body is not None:
@@ -238,18 +259,26 @@ def deploy(api: Api, cfg: dict, snap: dict, dry_run: bool) -> dict | None:
         return None
 
     keys = fetch_keys(api)
-    key_ids = [int(k["id"]) for k in keys if k.get("id") is not None] if keys else []
-    wanted = cfg.get("key_ids") or []
+    key_ids = [k["id"] for k in keys if k.get("id") is not None]
+    wanted = [str(k) for k in (cfg.get("key_ids") or [])]
     if wanted:
-        key_ids = [int(k) for k in wanted if int(k) in key_ids] or key_ids
+        filtered = [k for k in key_ids if str(k) in wanted]
+        if filtered:
+            key_ids = filtered
+        else:
+            warn(f"config.key_ids={wanted} 在账号里不存在，改用全部已登记 key")
     if not key_ids:
-        warn("账号没有登记 SSH key，无法建机：请先到面板 Settings 添加公钥")
+        warn("账号没有登记 SSH key，无法建机：请先跑 `key-add`")
         return None
 
     candidates = free_regions(snap, cfg.get("region_preference") or [])
     if not candidates:
-        warn("stock.open 为真但所有区域 freeOpen 均为假，跳过本轮")
-        return None
+        if dry_run:
+            candidates = list(cfg.get("region_preference") or list(snap["regions"]))[:1]
+            warn(f"当前无可用免费区域，dry-run 用首个偏好区域 {candidates} 演练")
+        else:
+            warn("stock.open 为真但所有区域 freeOpen 均为假，跳过本轮")
+            return None
     region = candidates[0]
 
     name = str(cfg.get("server_name") or "vyce-mini").lower()
@@ -258,7 +287,7 @@ def deploy(api: Api, cfg: dict, snap: dict, dry_run: bool) -> dict | None:
 
     body = {
         "name": name,
-        "os": cfg.get("os") or "ubuntu-24",
+        "os": resolve_os(cfg.get("os") or "ubuntu-24"),
         "region": region,
         "planId": "mini",
         "keyIds": key_ids,
@@ -271,11 +300,16 @@ def deploy(api: Api, cfg: dict, snap: dict, dry_run: bool) -> dict | None:
     try:
         created, _ = api.request("POST", "/api/servers", body)
     except ApiError as exc:
+        if exc.status == 503 or exc.payload.get("error") == "no_stock":
+            warn(f"没抢到：{exc}（名额在提交瞬间被拿走），继续监听")
+            return None
         if exc.status == 409:
             warn(f"没抢到（{exc}）——名额已被别人拿走，继续监听")
             return None
         if exc.status == 401:
             die("会话已失效，请重新导入 session.txt 里的 Cookie")
+        if exc.status == 400:
+            die(f"请求被拒：{exc} {exc.payload.get('fields') or ''}")
         raise
 
     sid = created.get("id")
@@ -442,14 +476,39 @@ def cmd_auth_check(api: Api, cfg: dict) -> int:
     servers = fetch_servers(api)
     keys = fetch_keys(api)
     free = [s for s in servers if s.get("source") == "free"]
+    age = me.get("githubCreatedAt")
     print(f"账号       : {me.get('username') or me.get('login')}")
-    print(f"GitHub 龄  : {me.get('githubCreatedAt') or '?'}")
+    if isinstance(age, (int, float)):
+        days = int((time.time() * 1000 - age) / 86400000)
+        print(f"GitHub 龄  : {days} 天" + ("" if days >= 30 else "  ⚠ 不足 30 天，无法建机"))
+    else:
+        print(f"GitHub 龄  : {age or '?'}")
     print(f"服务器     : {len(servers)} 台（免费 {len(free)} 台）")
     print(f"SSH keys   : {len(keys)} 个")
+    for k in keys:
+        print(f"  - #{k.get('id')} {k.get('name')}")
     if not keys:
-        warn("没有 SSH key，建机前请先在面板添加公钥")
+        warn("没有 SSH key，建机前请先跑 `key-add`")
     if free:
         info("已有免费机：本工具不会重复下单")
+    return 0
+
+
+def cmd_key_add(api: Api, cfg: dict, args) -> int:
+    pub_path = Path(args.pub).expanduser()
+    if not pub_path.exists():
+        die(f"公钥文件不存在：{pub_path}")
+    key = pub_path.read_text(encoding="utf-8", errors="replace").strip()
+    if not re.match(r"^(ssh-(rsa|ed25519)|ecdsa-sha2-)", key):
+        die(f"不像是 OpenSSH 公钥：{pub_path}")
+    name = args.name or pub_path.stem
+    existing = {k.get("name") for k in fetch_keys(api)}
+    if name in existing:
+        info(f"账号已有同名 key「{name}」，跳过")
+        return 0
+    payload, _ = api.request("POST", "/api/keys", {"name": name, "key": key})
+    kid = (payload.get("key") or {}).get("id") or payload.get("id")
+    ok(f"已登记公钥「{name}」id={kid}")
     return 0
 
 
@@ -458,9 +517,11 @@ def cmd_deploy(api: Api, cfg: dict, args) -> int:
     if not cookie:
         die("需要 session.txt 才能下单")
     snap = fetch_stock(api)
-    if not snap["open"]:
+    if not snap["open"] and not args.dry_run:
         warn("当前免费名额未开放，先跑 `watch`")
         return 2
+    if not snap["open"]:
+        warn("名额未开放；本次只做前置检查（dry-run 不会提交）")
     result = deploy(api, cfg, snap, dry_run=args.dry_run)
     return 0 if result else 3
 
@@ -523,6 +584,9 @@ def main(argv: list[str] | None = None) -> int:
     p_watch.add_argument("--deploy", action="store_true", help="检测到名额时自动下单")
     p_watch.add_argument("--dry-run", action="store_true", help="即使 --deploy 也不真正提交")
     sub.add_parser("auth-check", help="验证 session.txt 里的 Cookie 是否有效")
+    p_key = sub.add_parser("key-add", help="把本地公钥登记到账号（建机前置）")
+    p_key.add_argument("--pub", default="~/.ssh/id_ed25519.pub", help="公钥路径")
+    p_key.add_argument("--name", help="key 名称（默认取文件名）")
     p_dep = sub.add_parser("deploy", help="名额已开放时手动下单一次")
     p_dep.add_argument("--dry-run", action="store_true", help="只打印将要提交的内容")
     sub.add_parser("stats", help="统计 data/stock.jsonl 里的放号规律")
@@ -540,14 +604,19 @@ def main(argv: list[str] | None = None) -> int:
     api = Api(cfg["base_url"], load_cookie(),
               min_interval=cfg.get("min_request_interval", 1.0))
 
-    if args.cmd == "status":
-        return cmd_status(api, cfg)
-    if args.cmd == "watch":
-        return cmd_watch(api, cfg, args)
-    if args.cmd == "auth-check":
-        return cmd_auth_check(api, cfg)
-    if args.cmd == "deploy":
-        return cmd_deploy(api, cfg, args)
+    try:
+        if args.cmd == "status":
+            return cmd_status(api, cfg)
+        if args.cmd == "watch":
+            return cmd_watch(api, cfg, args)
+        if args.cmd == "auth-check":
+            return cmd_auth_check(api, cfg)
+        if args.cmd == "key-add":
+            return cmd_key_add(api, cfg, args)
+        if args.cmd == "deploy":
+            return cmd_deploy(api, cfg, args)
+    except ApiError as exc:
+        die(f"{exc}（HTTP {exc.status}）{json.dumps(exc.payload, ensure_ascii=False)[:300]}")
     return 2
 
 
