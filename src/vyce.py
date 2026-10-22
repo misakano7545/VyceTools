@@ -247,6 +247,184 @@ def append_log(record: dict) -> None:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+# ---------------------------------------------------------------- 续期
+
+DAY_MS = 86400000
+HOUR_MS = 3600000
+RENEW_STATE = DATA_DIR / "renew_state.json"
+
+
+def renew_state(server: dict, now_ms: int) -> dict:
+    """与站点前端 Hy() 完全一致的续期状态机。
+
+    前端源码（bundle）：
+      source!=free / suspended / creating  → none
+      status!=running                      → stopped  (可续期)
+      expiresAt - now <= 0                 → late     (可续期)
+      > 1 天                                → cooldown (不可续期，等冷却)
+      <= 6 小时                             → soon     (可续期)
+      其余                                  → ok       (可续期)
+    """
+    if server.get("source") != "free" or server.get("suspended") or server.get("status") == "creating":
+        return {"state": "none", "canRenew": False}
+    if server.get("status") != "running":
+        return {"state": "stopped", "canRenew": True}
+    expires = server.get("expiresAt")
+    if not isinstance(expires, (int, float)):
+        return {"state": "none", "canRenew": False}
+    left = int(expires - now_ms)
+    if left <= 0:
+        stop_at = server.get("stopsAt") or expires
+        return {"state": "late", "canRenew": True, "left": left,
+                "stopIn": max(0, int(stop_at - now_ms))}
+    if left > DAY_MS:
+        return {"state": "cooldown", "canRenew": False, "left": left,
+                "cooldownLeft": left - DAY_MS}
+    return {"state": "soon" if left <= 6 * HOUR_MS else "ok",
+            "canRenew": True, "left": left}
+
+
+def fmt_dur(ms) -> str:
+    if ms is None:
+        return "-"
+    neg = ms < 0
+    sec = abs(ms) // 1000
+    d, sec = divmod(sec, 86400)
+    h, sec = divmod(sec, 3600)
+    m = sec // 60
+    text = f"{d}天{h}小时" if d else (f"{h}小时{m}分" if h else f"{m}分")
+    return ("-" if neg else "") + text
+
+
+def load_renew_state() -> dict:
+    if RENEW_STATE.exists():
+        try:
+            return json.loads(RENEW_STATE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def save_renew_state(state: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = RENEW_STATE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(RENEW_STATE)
+
+
+def is_cooldown_error(status: int, msg: str) -> bool:
+    """服务端用 429 表达「24 小时冷却未到」，不是真限流。"""
+    if status != 429:
+        return False
+    low = str(msg).lower()
+    return any(p in low for p in (
+        "renewal_cooldown", "every 24 hours", "24 hour", "cooldown",
+        "please wait", "not eligible for renewal",
+    ))
+
+
+def renew_once(api: Api, cfg: dict, force: bool = False, dry_run: bool = False) -> int:
+    """检查并续期所有免费机。返回失败数量。"""
+    servers = fetch_servers(api)
+    free = [s for s in servers if s.get("source") == "free"]
+    if not free:
+        info("账号下没有免费服务器，无需续期")
+        return 0
+
+    now_ms = int(time.time() * 1000)
+    state = load_renew_state()
+    failures = 0
+
+    for srv in free:
+        sid = srv.get("id")
+        name = srv.get("name") or sid
+        st = renew_state(srv, now_ms)
+        kind = st["state"]
+        expires = srv.get("expiresAt")
+        exp_str = ts(datetime.fromtimestamp(expires / 1000, TZ)) if isinstance(expires, (int, float)) else "-"
+
+        print(f"\n[·] {name}  ({sid})")
+        print(f"    状态 {srv.get('status')}｜到期 {exp_str}｜剩余 {fmt_dur(st.get('left'))}")
+
+        if kind == "none":
+            info("    非免费机/已暂停/创建中，跳过")
+            continue
+        if kind == "cooldown" and not force:
+            wait = st["cooldownLeft"]
+            info(f"    冷却中，还需 {fmt_dur(wait)} 才进续期窗口"
+                 f"（预计 {ts(datetime.fromtimestamp((now_ms + wait) / 1000, TZ))}）")
+            state[sid] = {"name": name, "status": "cooldown", "expiresAt": expires,
+                          "next_renewal_ts": now_ms + wait,
+                          "next_renewal_str": ts(datetime.fromtimestamp((now_ms + wait) / 1000, TZ)),
+                          "last_check_ts": now_ms}
+            continue
+
+        if kind == "stopped":
+            info("    机器处于停止状态，续期会顺带开机")
+        if kind == "late":
+            warn("    已过到期时间，机器可能已停机，立即续期")
+
+        if dry_run:
+            ok("    dry-run：未提交 POST /renew")
+            continue
+
+        try:
+            payload, _ = api.request("POST", f"/api/servers/{sid}/renew")
+        except ApiError as exc:
+            msg = str(exc)
+            if is_cooldown_error(exc.status, msg):
+                m = re.search(r"wait\s+(\d+)\s+more\s+hour", msg, re.IGNORECASE)
+                wait_ms = int(m.group(1)) * HOUR_MS if m else st.get("cooldownLeft") or DAY_MS
+                info(f"    服务端仍报冷却（{msg}），等 {fmt_dur(wait_ms)}")
+                state[sid] = {"name": name, "status": "cooldown_429", "msg": msg,
+                              "next_renewal_ts": now_ms + wait_ms,
+                              "next_renewal_str": ts(datetime.fromtimestamp((now_ms + wait_ms) / 1000, TZ)),
+                              "last_check_ts": now_ms}
+                continue
+            if exc.status == 401:
+                die("会话已失效，请重新导入 session.txt 里的 Cookie")
+            if exc.status == 404:
+                warn(f"    服务器已不存在（{msg}），从记录里移除")
+                state.pop(sid, None)
+                continue
+            warn(f"    续期失败（HTTP {exc.status}）：{msg}")
+            state[sid] = {"name": name, "status": "failed", "error": msg, "last_check_ts": now_ms}
+            failures += 1
+            continue
+
+        # 续期后必须回读确认，不能只信 200
+        fresh = None
+        try:
+            fresh = next((s for s in fetch_servers(api) if s.get("id") == sid), None)
+        except ApiError as exc:
+            warn(f"    续期请求已发出，但回读失败：{exc}")
+            state[sid] = {"name": name, "status": "renewed_unverified", "error": str(exc),
+                          "last_check_ts": now_ms}
+            failures += 1
+            continue
+
+        new_exp = (fresh or {}).get("expiresAt")
+        if isinstance(new_exp, (int, float)) and isinstance(expires, (int, float)) and new_exp > expires:
+            new_left = int(new_exp - now_ms)
+            ok(f"    续期成功：到期 {ts(datetime.fromtimestamp(new_exp / 1000, TZ))}（剩余 {fmt_dur(new_left)}）")
+            state[sid] = {"name": name, "status": "success", "expiresAt": new_exp,
+                          "last_renew_ts": now_ms, "last_renew_str": ts(),
+                          "next_renewal_ts": now_ms + DAY_MS,
+                          "next_renewal_str": ts(datetime.fromtimestamp((now_ms + DAY_MS) / 1000, TZ))}
+        elif fresh is None:
+            warn("    回读时已找不到该服务器")
+            failures += 1
+        else:
+            warn(f"    接口返回成功但到期时间未推进（{exp_str}），可能被服务端忽略")
+            state[sid] = {"name": name, "status": "renewed_unverified", "expiresAt": new_exp,
+                          "last_check_ts": now_ms}
+            failures += 1
+
+    save_renew_state(state)
+    return failures
+
+
+
 # ---------------------------------------------------------------- 开抢
 
 def deploy(api: Api, cfg: dict, snap: dict, dry_run: bool) -> dict | None:
@@ -322,6 +500,7 @@ def deploy(api: Api, cfg: dict, snap: dict, dry_run: bool) -> dict | None:
         "region": region,
         "os": body["os"],
         "status": result.get("status"),
+        "expiresAt": result.get("expiresAt"),
         "connect": result.get("connect") or created.get("connect"),
         "ipv6": result.get("ipv6") or created.get("ipv6"),
         "credentials": result.get("credentials") or created.get("credentials"),
@@ -386,11 +565,56 @@ def cmd_status(api: Api, cfg: dict) -> int:
             free = [s for s in servers if s.get("source") == "free"]
             print(f"登录身份   : {me.get('username') or me.get('login') or '?'} "
                   f"(免费机 {len(free)} 台 / 共 {len(servers)} 台)")
+            now_ms = int(time.time() * 1000)
+            for srv in free:
+                st = renew_state(srv, now_ms)
+                exp = srv.get("expiresAt")
+                exp_str = ts(datetime.fromtimestamp(exp / 1000, TZ)) if isinstance(exp, (int, float)) else "-"
+                label = {
+                    "cooldown": f"冷却中，{fmt_dur(st.get('cooldownLeft'))} 后可续",
+                    "ok": "可续期",
+                    "soon": "可续期（即将到期）",
+                    "late": "已过期，需立即续期",
+                    "stopped": "已停机，续期会开机",
+                    "none": "不可续期",
+                }.get(st["state"], st["state"])
+                print(f"  - {srv.get('name') or srv.get('id')}  {srv.get('status')}"
+                      f"  到期 {exp_str}  剩余 {fmt_dur(st.get('left'))}  → {label}")
         except ApiError as exc:
             print(f"登录身份   : 会话无效（{exc}）—— 重新导出 Cookie 到 session.txt")
     else:
         print("登录身份   : 未配置 session.txt（只读监听仍可用）")
     return 0
+
+
+def cmd_renew(api: Api, cfg: dict, args) -> int:
+    cookie = load_cookie()
+    if not cookie:
+        die("需要 session.txt 才能续期")
+    if not args.loop:
+        failures = renew_once(api, cfg, force=args.force, dry_run=args.dry_run)
+        return 0 if failures == 0 else 1
+
+    interval = max(300, int(args.interval or 1800))
+    info(f"续期守护启动：每 {interval // 60} 分钟检查一次（Ctrl+C 结束）")
+    while True:
+        try:
+            failures = renew_once(api, cfg, force=False, dry_run=args.dry_run)
+            if failures:
+                warn(f"本轮有 {failures} 台续期失败，下轮重试")
+        except ApiError as exc:
+            if exc.status == 401:
+                die("会话已失效，请重新导入 session.txt 里的 Cookie")
+            warn(f"本轮检查失败：{exc}")
+        if args.seconds and args.seconds > 0:
+            args.seconds -= interval
+            if args.seconds <= 0:
+                return 0
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            info("已停止")
+            return 0
 
 
 def cmd_watch(api: Api, cfg: dict, args) -> int:
@@ -410,6 +634,9 @@ def cmd_watch(api: Api, cfg: dict, args) -> int:
     started = time.monotonic()
     last_beat = started
     checks = 0
+    next_renew = started if (args.renew and cookie) else float("inf")
+    if args.renew and not cookie:
+        warn("--renew 需要 session.txt，本次不续期")
     try:
         while True:
             if args.seconds and time.monotonic() - started >= args.seconds:
@@ -458,6 +685,17 @@ def cmd_watch(api: Api, cfg: dict, args) -> int:
                 last_beat = time.monotonic()
                 info(f"心跳：{checks} 次轮询，当前{'开放' if snap['open'] else '关闭'}，"
                      f"最近延迟 {latency:.0f}ms")
+
+            if time.monotonic() >= next_renew:
+                next_renew = time.monotonic() + 1800
+                try:
+                    renew_once(api, cfg, force=False, dry_run=args.dry_run)
+                except ApiError as exc:
+                    if exc.status == 401:
+                        warn("Cookie 已失效，续期停用；库存监听继续")
+                        next_renew = float("inf")
+                    else:
+                        warn(f"续期检查失败：{exc}")
 
             elapsed = time.monotonic() - t0
             time.sleep(max(0.0, interval - elapsed) + random.uniform(0, 0.15))
@@ -583,12 +821,20 @@ def main(argv: list[str] | None = None) -> int:
     p_watch.add_argument("--seconds", type=int, default=0, help="跑多少秒后退出，0=一直跑")
     p_watch.add_argument("--deploy", action="store_true", help="检测到名额时自动下单")
     p_watch.add_argument("--dry-run", action="store_true", help="即使 --deploy 也不真正提交")
+    p_watch.add_argument("--renew", action="store_true",
+                         help="顺带每 30 分钟做一次续期检查（需要 Cookie）")
     sub.add_parser("auth-check", help="验证 session.txt 里的 Cookie 是否有效")
     p_key = sub.add_parser("key-add", help="把本地公钥登记到账号（建机前置）")
     p_key.add_argument("--pub", default="~/.ssh/id_ed25519.pub", help="公钥路径")
     p_key.add_argument("--name", help="key 名称（默认取文件名）")
     p_dep = sub.add_parser("deploy", help="名额已开放时手动下单一次")
     p_dep.add_argument("--dry-run", action="store_true", help="只打印将要提交的内容")
+    p_ren = sub.add_parser("renew", help="给免费机续期（24 小时冷却窗口内才生效）")
+    p_ren.add_argument("--force", action="store_true", help="无视冷却，直接尝试续期")
+    p_ren.add_argument("--dry-run", action="store_true", help="只判断状态，不提交")
+    p_ren.add_argument("--loop", action="store_true", help="常驻守护，按间隔反复检查")
+    p_ren.add_argument("--interval", type=int, default=1800, help="守护模式检查间隔秒（默认 1800）")
+    p_ren.add_argument("--seconds", type=int, default=0, help="守护模式总共跑多少秒，0=一直跑")
     sub.add_parser("stats", help="统计 data/stock.jsonl 里的放号规律")
 
     args = parser.parse_args(argv)
@@ -615,6 +861,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_key_add(api, cfg, args)
         if args.cmd == "deploy":
             return cmd_deploy(api, cfg, args)
+        if args.cmd == "renew":
+            return cmd_renew(api, cfg, args)
     except ApiError as exc:
         die(f"{exc}（HTTP {exc.status}）{json.dumps(exc.payload, ensure_ascii=False)[:300]}")
     return 2

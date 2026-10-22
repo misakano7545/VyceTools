@@ -18,6 +18,29 @@ python src/vyce.py watch
 python src/vyce.py stats
 ```
 
+### 续期（24 小时冷却窗口）
+
+```bash
+python src/vyce.py renew                 # 检查一次，可续就续
+python src/vyce.py renew --dry-run       # 只判断状态
+python src/vyce.py renew --force         # 无视冷却直接试（服务端可能 429）
+python src/vyce.py renew --loop          # 常驻守护，默认每 30 分钟检查
+python src/vyce.py watch --deploy --renew # 抢机 + 续期合到一个进程
+```
+
+续期状态机与站点前端 `Hy()` 完全一致（`source=free` 且 `status=running` 时按 `expiresAt` 判断）：
+
+| 剩余时间 | 状态 | 能否续期 |
+|---|---|---|
+| > 24 小时 | `cooldown` | 否，等冷却走完 |
+| 24 小时 ≥ 剩余 > 6 小时 | `ok` | 是 |
+| ≤ 6 小时 | `soon` | 是 |
+| ≤ 0（已过期） | `late` | 是，机器可能已停机 |
+| `status != running` | `stopped` | 是，续期会顺带开机 |
+| `suspended` / `creating` / 付费机 | `none` | 跳过 |
+
+续期结果写入 `data/renew_state.json`；**每次续期后都会回读 `/api/servers` 确认 `expiresAt` 真的推进**，只信 200 不算成功。服务端用 `429 renewal_cooldown` 表达「冷却未到」，属于预期而非故障，会按 `wait N more hours` 计算下次窗口。
+
 ### 需要真正下单时（M1）
 
 1. 浏览器登录 https://vyce.cloud（GitHub OAuth，账号需 ≥ 30 天）。
@@ -42,6 +65,7 @@ python src/vyce.py watch --deploy --dry-run # 演练：只打印将要提交的�
 | `auth-check` | 验证 `session.txt` 的 Cookie 与账号资格（GitHub 龄、SSH key） |
 | `key-add [--pub PATH] [--name N]` | 把本地公钥登记到账号（建机前置） |
 | `deploy [--dry-run]` | 名额已开放时手动下单一次 |
+| `renew [--force] [--dry-run] [--loop] [--interval N]` | 免费机续期；`--loop` 常驻守护（默认 30 分钟一轮） |
 | `stats` | 汇总放号时段分布与最近记录 |
 
 ## 配置
@@ -66,7 +90,7 @@ python src/vyce.py watch --deploy --dry-run # 演练：只打印将要提交的�
 ## 设计边界（重要）
 
 - **单账号、单机**：ToS 规定一人一号、一个免费实例；工具下单前会检查是否已有 `source=free` 的机器，有则拒绝。
-- **不自动续期**：面板的 Renew 按钮先弹广告再调 `/renew`，脚本代点等于刷广告量。工具只提醒，续期请手动完成。
+- **自动续期已实现（M2，按用户要求）**：面板 Renew 按钮是「先弹广告再调接口」，但 `/api/servers/{id}/renew` 本身不校验广告令牌——广告门是纯前端 `sessionStorage` 逻辑。本工具直接调接口，因此**不会产生广告曝光**。这是本工具唯一一处明确绕开站点变现路径的行为，风险自担；服务端若将来加校验，工具会收到 4xx 并如实报错，不会伪装成功。
 - **不轰炸**：默认 2s 轮询 ≈ 30 次/分钟，是站点 300 次/分钟限流的 10%；遇 429 按 `x-ratelimit-reset` 退避。
 - **不碰账号体系**：不代注册、不绕 30 天账号限制、不多开、不并发多 IP。
 
