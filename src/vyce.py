@@ -427,6 +427,14 @@ def renew_once(api: Api, cfg: dict, force: bool = False, dry_run: bool = False) 
 
 # ---------------------------------------------------------------- 开抢
 
+def unwrap_created(payload: dict) -> dict:
+    """POST /api/servers 返回 {server:{...}, credentials:{...}}（前端 g_ 里 `{...t.server, credentials}`）。
+    兼容裸 server 对象。实测只传裸对象会导致 id=None、后续全部失效。"""
+    if isinstance(payload, dict) and isinstance(payload.get("server"), dict):
+        return payload["server"]
+    return payload if isinstance(payload, dict) else {}
+
+
 def deploy(api: Api, cfg: dict, snap: dict, dry_run: bool) -> dict | None:
     """在确认有名额后尝试下单。返回服务器信息或 None。"""
     me = fetch_me(api)
@@ -476,7 +484,7 @@ def deploy(api: Api, cfg: dict, snap: dict, dry_run: bool) -> dict | None:
         return None
 
     try:
-        created, _ = api.request("POST", "/api/servers", body)
+        payload, _ = api.request("POST", "/api/servers", body)
     except ApiError as exc:
         if exc.status == 503 or exc.payload.get("error") == "no_stock":
             warn(f"没抢到：{exc}（名额在提交瞬间被拿走），继续监听")
@@ -490,7 +498,26 @@ def deploy(api: Api, cfg: dict, snap: dict, dry_run: bool) -> dict | None:
             die(f"请求被拒：{exc} {exc.payload.get('fields') or ''}")
         raise
 
+    # POST /api/servers 返回 {server:{...}, credentials:{...}}（前端 g_ 里 `{...t.server, credentials:t.credentials}`）
+    # 兼容裸 server 对象的老格式。
+    payload = payload or {}
+    created = unwrap_created(payload)
     sid = created.get("id")
+    if not sid:
+        # 兜底：接口没给 id 就回读列表，取最新那台免费机
+        warn("下单响应里没有 id，回读服务器列表定位新机……")
+        try:
+            latest = [s for s in fetch_servers(api) if s.get("source") == "free"]
+            latest.sort(key=lambda s: s.get("createdAt") or 0, reverse=True)
+            if latest:
+                created = latest[0]
+                sid = created.get("id")
+        except ApiError as exc:
+            warn(f"回读列表失败：{exc}")
+    if not sid:
+        warn("无法确定新服务器 id，请到面板查看")
+        return None
+
     info(f"下单返回 id={sid}，等待建机完成……")
     result = wait_for_server(api, sid, cfg.get("max_deploy_wait_seconds", 600))
     record = {
@@ -503,7 +530,7 @@ def deploy(api: Api, cfg: dict, snap: dict, dry_run: bool) -> dict | None:
         "expiresAt": result.get("expiresAt"),
         "connect": result.get("connect") or created.get("connect"),
         "ipv6": result.get("ipv6") or created.get("ipv6"),
-        "credentials": result.get("credentials") or created.get("credentials"),
+        "credentials": result.get("credentials") or payload.get("credentials") or created.get("credentials"),
     }
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     LAST_SERVER.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
