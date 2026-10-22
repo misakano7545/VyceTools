@@ -5,6 +5,7 @@
   "server_name": "vyce-mini",
   "os": "ubuntu-24",
   "region_preference": ["Europe", "Asia", "USA"],
+  "region_allow": [],
   "key_ids": [],
   "max_deploy_wait_seconds": 600
 }

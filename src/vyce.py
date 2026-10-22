@@ -62,9 +62,18 @@ DEFAULTS = {
     "server_name": "vyce-mini",
     "os": "ubuntu-24",
     "region_preference": ["Europe", "Asia", "USA"],
+    "region_allow": [],
     "key_ids": [],
     "auto_deploy": False,
     "max_deploy_wait_seconds": 600,
+}
+
+# 区域别名：站点 id 是 Europe / Asia / USA（取自 /api/stock 的 regions[].id），
+# 这里额外认一批常见写法，省得用户为了大小写去翻文档。
+REGION_ALIASES = {
+    "eu": "Europe", "europe": "Europe", "欧洲": "Europe",
+    "asia": "Asia", "ap": "Asia", "asia-pacific": "Asia", "亚洲": "Asia",
+    "us": "USA", "usa": "USA", "na": "USA", "america": "USA", "美国": "USA",
 }
 
 
@@ -221,9 +230,82 @@ def fetch_stock(api: Api) -> dict:
     }
 
 
-def free_regions(snap: dict, preference: list[str]) -> list[str]:
-    order = list(preference) + [r for r in snap["regions"] if r not in preference]
-    return [r for r in order if snap["regions"].get(r, {}).get("freeOpen")]
+def free_regions(snap: dict, preference: list[str], allow: list[str] | None = None) -> list[str]:
+    """当前可抢的免费区域。allow 非空时只在这些区域里挑（严格白名单）。"""
+    return [r for r in region_pool(snap, preference, allow)
+            if snap["regions"][r].get("freeOpen")]
+
+
+def region_pool(snap: dict, preference: list[str] | None, allow: list[str] | None = None) -> list[str]:
+    """按偏好排序的候选区域池（不管 freeOpen），allow 非空则只保留白名单内的。"""
+    allowed = set(allow) if allow else None
+    order: list[str] = []
+    for rid in (preference or []):
+        if rid in snap["regions"] and (allowed is None or rid in allowed) and rid not in order:
+            order.append(rid)
+    for rid in snap["regions"]:
+        if (allowed is None or rid in allowed) and rid not in order:
+            order.append(rid)
+    return order
+
+
+def parse_region_values(raw_values) -> list[str]:
+    """`--region Asia --region eu` / `--region "Asia,USA"` / 全角逗号 都归一成列表。"""
+    out: list[str] = []
+    for raw in raw_values or []:
+        for piece in str(raw).replace("，", ",").split(","):
+            piece = piece.strip()
+            if piece:
+                out.append(piece)
+    return out
+
+
+def normalize_regions(values: list[str], known: dict, strict: bool) -> list[str]:
+    """把区域名归一化成站点里的规范 id（大小写/别名都认）。
+
+    strict=True 时遇到未知区域直接报错退出：用户手打 `--region asia-pacfic`
+    这类拼写错误如果静默忽略，表现就是「一直在监听却永远不抢」，很难排查。
+    """
+    if not values:
+        return []
+    canon_by_lower = {str(k).lower(): k for k in known}
+    out: list[str] = []
+    bad: list[str] = []
+    for v in values:
+        low = str(v).strip().lower()
+        canon = canon_by_lower.get(low)
+        if canon is None:
+            alias = REGION_ALIASES.get(low)
+            if alias and (not known or alias in known):
+                canon = alias
+        if canon is None:
+            bad.append(v)
+        elif canon not in out:
+            out.append(canon)
+    if bad:
+        if strict:
+            die(f"未知区域：{', '.join(map(str, bad))}；站点当前区域为 "
+                f"{', '.join(map(str, known)) or '（取不到）'}，也可用别名 eu / asia / us")
+        warn(f"忽略未知区域：{', '.join(map(str, bad))}"
+             f"（站点当前区域：{', '.join(map(str, known)) or '取不到'}）")
+    return out
+
+
+def resolve_region_filter(cfg: dict, args, known: dict) -> tuple[list[str], list[str]]:
+    """算出本次运行的 (preference, allow)。
+
+    - config.region_allow / --region：严格白名单，不在里面的区域一律不下单；
+    - config.region_preference：只是同一批候选里的优先顺序，不限制范围；
+    - --any-region：清空两者，回到「哪个区先开就抢哪个」。
+    """
+    pref = [str(x) for x in (cfg.get("region_preference") or [])]
+    allow = [str(x) for x in (cfg.get("region_allow") or [])]
+    cli = parse_region_values(getattr(args, "region", None))
+    if getattr(args, "any_region", False):
+        pref, allow = [], []
+    elif cli:
+        allow = cli
+    return normalize_regions(pref, known, strict=False), normalize_regions(allow, known, strict=True)
 
 
 def fetch_me(api: Api) -> dict:
@@ -435,8 +517,10 @@ def unwrap_created(payload: dict) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def deploy(api: Api, cfg: dict, snap: dict, dry_run: bool) -> dict | None:
+def deploy(api: Api, cfg: dict, snap: dict, dry_run: bool,
+           region_filter: tuple[list[str], list[str]] | None = None) -> dict | None:
     """在确认有名额后尝试下单。返回服务器信息或 None。"""
+    pref, allow = region_filter if region_filter else resolve_region_filter(cfg, None, snap["regions"])
     me = fetch_me(api)
     servers = fetch_servers(api)
     mine = [s for s in servers if s.get("source") == "free"]
@@ -457,13 +541,21 @@ def deploy(api: Api, cfg: dict, snap: dict, dry_run: bool) -> dict | None:
         warn("账号没有登记 SSH key，无法建机：请先跑 `key-add`")
         return None
 
-    candidates = free_regions(snap, cfg.get("region_preference") or [])
+    candidates = free_regions(snap, pref, allow)
     if not candidates:
+        pool = region_pool(snap, pref, allow)
         if dry_run:
-            candidates = list(cfg.get("region_preference") or list(snap["regions"]))[:1]
-            warn(f"当前无可用免费区域，dry-run 用首个偏好区域 {candidates} 演练")
+            if not pool:
+                die(f"指定区域 {', '.join(allow) or '（空）'} 都不在站点区域列表里，无法演练")
+            candidates = pool[:1]
+            warn(f"当前无可用免费区域，dry-run 用首个候选区域 {candidates[0]} 演练")
         else:
-            warn("stock.open 为真但所有区域 freeOpen 均为假，跳过本轮")
+            opened = [r for r, st in snap["regions"].items() if st.get("freeOpen")]
+            if opened and allow:
+                warn(f"名额开在 {', '.join(opened)}，但不在你指定的区域 "
+                     f"{', '.join(allow)} 内，跳过本轮")
+            else:
+                warn("stock.open 为真但所有区域 freeOpen 均为假，跳过本轮")
             return None
     region = candidates[0]
 
@@ -573,18 +665,26 @@ def wait_for_server(api: Api, sid, max_wait: int) -> dict:
 
 # ---------------------------------------------------------------- 子命令
 
-def cmd_status(api: Api, cfg: dict) -> int:
+def cmd_status(api: Api, cfg: dict, args=None) -> int:
     snap = fetch_stock(api)
+    pref, allow = resolve_region_filter(cfg, args, snap["regions"])
     print(f"时间       : {ts()}")
     print(f"免费名额   : {'开放 ✅' if snap['open'] else '未开放'}"
           f"（enabled={snap['enabled']}）")
     print("区域       :")
     for rid, st in snap["regions"].items():
         flag = "free=开 " if st["freeOpen"] else "free=关 "
-        print(f"  - {rid:<7} {flag} (region.open={st['open']})")
-    cands = free_regions(snap, cfg.get("region_preference") or [])
+        mark = "" if not allow or rid in allow else "  ← 已排除（不在 region_allow/--region 内）"
+        print(f"  - {rid:<7} {flag} (region.open={st['open']}){mark}")
+    scope = f"限定 {'/'.join(allow)}" if allow else "不限（按 preference 排序）"
+    pref_shown = [r for r in pref if not allow or r in allow]
+    print(f"区域范围   : {scope}"
+          + (f"｜优先顺序 {' > '.join(pref_shown)}" if pref_shown else ""))
+    cands = free_regions(snap, pref, allow)
     if cands:
         print(f"可抢区域   : {', '.join(cands)}")
+    elif allow and any(st["freeOpen"] for st in snap["regions"].values()):
+        print("可抢区域   : 无（名额开在别的区域，已被 region_allow 过滤）")
     if SESSION_PATH.exists() or load_cookie():
         try:
             me = fetch_me(api)
@@ -650,6 +750,8 @@ def cmd_watch(api: Api, cfg: dict, args) -> int:
     auto = bool(args.deploy) and bool(cookie) and not args.dry_run
     if args.deploy and not cookie:
         warn("没有 session.txt，无法下单；本次退化为只读监听")
+    pref: list[str] = []
+    allow: list[str] = []
     if auto:
         me = fetch_me(api)
         ok(f"以 {me.get('username') or me.get('login')} 身份监听；检测到名额将自动下单")
@@ -658,6 +760,7 @@ def cmd_watch(api: Api, cfg: dict, args) -> int:
 
     print(f"[·] 轮询间隔 {interval:.1f}s，Ctrl+C 结束")
     prev = None
+    regions_ready = False
     started = time.monotonic()
     last_beat = started
     checks = 0
@@ -677,36 +780,49 @@ def cmd_watch(api: Api, cfg: dict, args) -> int:
                 continue
             latency = (time.monotonic() - t0) * 1000
             checks += 1
-            cands = free_regions(snap, cfg.get("region_preference") or [])
+            if not regions_ready:
+                # 第一次拿到 /api/stock 才知道站点有哪些区域，这时才做区域名校验，
+                # 不为了一次校验多发一个请求。
+                pref, allow = resolve_region_filter(cfg, args, snap["regions"])
+                regions_ready = True
+                if allow:
+                    info(f"区域限定：{', '.join(allow)}（其他区域即使开放也不会下单）")
+            cands = free_regions(snap, pref, allow)
+            # stock.jsonl 里记「实际开放的全部区域」，不受 --region 过滤影响，
+            # 否则限定区域的用户会把自己没要的那些放号记录丢掉，统计就失真了。
+            opened = [r for r, st in snap["regions"].items() if st.get("freeOpen")]
 
             if prev is None:
                 state = "开放" if snap["open"] else "关闭"
                 info(f"当前状态：{state}｜区域 {', '.join(snap['regions']) or '-'}｜{latency:.0f}ms")
-            elif snap["open"] != prev["open"] or cands != prev["cands"]:
+            elif snap["open"] != prev["open"] or opened != prev["opened"]:
                 append_log({
                     "ts": ts(),
                     "epoch": int(time.time()),
                     "open": snap["open"],
                     "regions": snap["regions"],
-                    "free_regions": cands,
+                    "free_regions": opened,
+                    "eligible_regions": cands,
                     "latency_ms": round(latency),
                 })
                 if snap["open"] and cands:
                     ok(f"名额开放！区域：{', '.join(cands)}（{latency:.0f}ms）")
                     if auto:
                         try:
-                            deploy(api, cfg, snap, dry_run=False)
+                            deploy(api, cfg, snap, dry_run=False, region_filter=(pref, allow))
                         except ApiError as exc:
                             warn(f"下单异常：{exc}")
-                        prev = {"open": snap["open"], "cands": cands}
+                        prev = {"open": snap["open"], "opened": opened}
                         info("已尝试下单，继续监听")
                         time.sleep(interval)
                         continue
                     print("\a", end="", flush=True)
+                elif opened and allow:
+                    info(f"名额开在 {', '.join(opened)}，不在指定区域 {', '.join(allow)} 内，继续等")
                 else:
-                    info(f"名额关闭（区域 {', '.join(cands) or '-'}）")
+                    info(f"名额关闭（区域 {', '.join(opened) or '-'}）")
 
-            prev = {"open": snap["open"], "cands": cands}
+            prev = {"open": snap["open"], "opened": opened}
 
             if time.monotonic() - last_beat > 300:
                 last_beat = time.monotonic()
@@ -782,12 +898,15 @@ def cmd_deploy(api: Api, cfg: dict, args) -> int:
     if not cookie:
         die("需要 session.txt 才能下单")
     snap = fetch_stock(api)
+    pref, allow = resolve_region_filter(cfg, args, snap["regions"])
+    if allow:
+        info(f"区域限定：{', '.join(allow)}")
     if not snap["open"] and not args.dry_run:
         warn("当前免费名额未开放，先跑 `watch`")
         return 2
     if not snap["open"]:
         warn("名额未开放；本次只做前置检查（dry-run 不会提交）")
-    result = deploy(api, cfg, snap, dry_run=args.dry_run)
+    result = deploy(api, cfg, snap, dry_run=args.dry_run, region_filter=(pref, allow))
     return 0 if result else 3
 
 
@@ -842,7 +961,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", help="配置文件路径（默认项目根 config.json）")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("status", help="看一次当前名额与账号状态")
+    p_status = sub.add_parser("status", help="看一次当前名额与账号状态")
     p_watch = sub.add_parser("watch", help="持续轮询，名额放出时告警/下单")
     p_watch.add_argument("--interval", type=float, help="轮询间隔秒（默认取配置 2.0）")
     p_watch.add_argument("--seconds", type=int, default=0, help="跑多少秒后退出，0=一直跑")
@@ -856,6 +975,11 @@ def main(argv: list[str] | None = None) -> int:
     p_key.add_argument("--name", help="key 名称（默认取文件名）")
     p_dep = sub.add_parser("deploy", help="名额已开放时手动下单一次")
     p_dep.add_argument("--dry-run", action="store_true", help="只打印将要提交的内容")
+    for p in (p_watch, p_dep, p_status):
+        p.add_argument("--region", action="append", metavar="区域",
+                       help="只在这些区域下单，可重复或用逗号分隔（如 --region asia --region eu）")
+        p.add_argument("--any-region", action="store_true",
+                       help="忽略 region_allow/region_preference，哪个区先开抢哪个")
     p_ren = sub.add_parser("renew", help="给免费机续期（24 小时冷却窗口内才生效）")
     p_ren.add_argument("--force", action="store_true", help="无视冷却，直接尝试续期")
     p_ren.add_argument("--dry-run", action="store_true", help="只判断状态，不提交")
@@ -879,7 +1003,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.cmd == "status":
-            return cmd_status(api, cfg)
+            return cmd_status(api, cfg, args)
         if args.cmd == "watch":
             return cmd_watch(api, cfg, args)
         if args.cmd == "auth-check":

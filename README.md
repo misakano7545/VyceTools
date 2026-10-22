@@ -60,13 +60,45 @@ python src/vyce.py watch --deploy --dry-run # 演练：只打印将要提交的�
 
 | 命令 | 作用 |
 |---|---|
-| `status` | 打印当前名额、各区域 `freeOpen`、账号/免费机数量 |
-| `watch [--interval 2] [--seconds N] [--deploy] [--dry-run]` | 轮询库存；状态翻转写 `data/stock.jsonl`，`--deploy` 时自动下单 |
+| `status [--region R] [--any-region]` | 打印当前名额、各区域 `freeOpen`、账号/免费机数量 |
+| `watch [--interval 2] [--seconds N] [--deploy] [--dry-run] [--region R] [--any-region]` | 轮询库存；状态翻转写 `data/stock.jsonl`，`--deploy` 时自动下单 |
 | `auth-check` | 验证 `session.txt` 的 Cookie 与账号资格（GitHub 龄、SSH key） |
 | `key-add [--pub PATH] [--name N]` | 把本地公钥登记到账号（建机前置） |
-| `deploy [--dry-run]` | 名额已开放时手动下单一次 |
+| `deploy [--dry-run] [--region R] [--any-region]` | 名额已开放时手动下单一次 |
 | `renew [--force] [--dry-run] [--loop] [--interval N]` | 免费机续期；`--loop` 常驻守护（默认 30 分钟一轮） |
 | `stats` | 汇总放号时段分布与最近记录 |
+
+## 自定义区域
+
+站点只有三个区域：`Europe` / `Asia` / `USA`（取自 `/api/stock` 的 `regions[].id`）。三种玩法：
+
+```bash
+# 只要亚洲：其他区域即使放号也不下单
+python src/vyce.py watch --deploy --region asia
+
+# 多个区域，按给定顺序优先（Europe 先，其次 USA）
+python src/vyce.py watch --deploy --region eu,us
+
+# 不管配置怎么写，这次哪个区先开抢哪个
+python src/vyce.py watch --deploy --any-region
+```
+
+- `--region` 可重复、可用逗号、可用全角逗号；认别名 `eu/asia/us/ap/na/欧洲/亚洲/美国`，大小写不敏感。
+- 拼错的区域**直接报错退出**（`[x] 未知区域：asia-pacfic；站点当前区域为 ...`），不会静默变成「一直监听却永不抢」。
+- 写进配置则用 `region_allow`（严格白名单，`[]` = 不限）：
+
+```json
+{ "region_preference": ["Europe", "Asia", "USA"], "region_allow": ["Asia"] }
+```
+
+`region_preference` 和 `region_allow` 的分工容易混，记住一句：
+
+| 配置项 | 作用 | 区域外放号时 |
+|---|---|---|
+| `region_preference` | 只决定**同一批候选里的先后顺序** | 照样会抢 |
+| `region_allow` / `--region` | **严格白名单**，范围外的区域直接忽略 | 不下单，日志写「名额开在 X，但不在你指定的区域」 |
+
+`data/stock.jsonl` 里的 `free_regions` 始终记**实际开放的全部区域**，另存一份 `eligible_regions`（过滤后）。这样限定区域的用户也不会把统计样本弄丢。
 
 ## 配置
 
@@ -79,6 +111,7 @@ python src/vyce.py watch --deploy --dry-run # 演练：只打印将要提交的�
   "server_name": "vyce-mini",
   "os": "ubuntu-24",
   "region_preference": ["Europe", "Asia", "USA"],
+  "region_allow": [],
   "key_ids": []
 }
 ```
@@ -86,6 +119,7 @@ python src/vyce.py watch --deploy --dry-run # 演练：只打印将要提交的�
 - `os`：`ubuntu-24` / `ubuntu-22` / `debian-12` / `fedora-41` / `alma-9`
 - `key_ids`：留空 = 用账号里所有已登记公钥
 - `server_name`：3–24 位小写字母/数字/连字符（站点正则）
+- `region_allow`：严格白名单，`[]` = 不限区域
 
 ## 设计边界（重要）
 
