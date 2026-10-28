@@ -4,8 +4,10 @@ name: grab
 # 所以策略是「每 5 分钟拉起一次，每次在 job 里持续轮询约 4 分半」——
 # 两次 job 首尾几乎相接，实际覆盖接近连续监听。
 on:
-  schedule:
-    - cron: "*/5 * * * *"
+  # 自动运行暂时关掉（用户要求，等他回家再开）。
+  # 恢复方法：把下面两行的注释去掉，并确认 VYCE_COOKIE secret 已配置。
+  # schedule:
+  #   - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       region:

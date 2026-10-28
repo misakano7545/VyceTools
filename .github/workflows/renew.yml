@@ -6,8 +6,10 @@ name: renew
 # 注意：续期接口现在要求 Bestcap 验证码。job 里用无头 Chrome 走官方控件自动通过；
 # ubuntu-latest 自带 node 与 google-chrome，通常不需要额外安装。
 on:
-  schedule:
-    - cron: "0 */6 * * *"
+  # 自动运行暂时关掉（用户要求，等他回家再开）。
+  # 恢复方法：把下面两行的注释去掉。
+  # schedule:
+  #   - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       force:
