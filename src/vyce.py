@@ -30,6 +30,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NoReturn
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
@@ -95,13 +96,83 @@ def ts(dt: datetime | None = None) -> str:
     return (dt or now()).strftime("%Y-%m-%d %H:%M:%S")
 
 
+ENV_TRUE = {"1", "true", "yes", "on", "y"}
+ENV_FALSE = {"0", "false", "no", "off", "n", ""}
+
+
+def _env_str(name: str, raw: str) -> str:
+    return raw.strip()
+
+
+def _env_bool(name: str, raw: str) -> bool:
+    low = raw.strip().lower()
+    if low in ENV_TRUE:
+        return True
+    if low in ENV_FALSE:
+        return False
+    die(f"环境变量 {name} 取值无法识别：{raw!r}（用 1/0、true/false）")
+
+
+def _env_int(name: str, raw: str) -> int:
+    try:
+        return int(float(raw.strip()))
+    except ValueError:
+        die(f"环境变量 {name} 需要整数，收到 {raw!r}")
+
+
+def _env_float(name: str, raw: str) -> float:
+    try:
+        return float(raw.strip())
+    except ValueError:
+        die(f"环境变量 {name} 需要数字，收到 {raw!r}")
+
+
+def _env_list(name: str, raw: str) -> list[str]:
+    return [p.strip() for p in raw.replace("，", ",").split(",") if p.strip()]
+
+
+# 环境变量名 → (配置键, 类型)。CI 里没有 config.json，全靠这一层。
+ENV_CONFIG_MAP = {
+    "VYCE_BASE_URL": ("base_url", "str"),
+    "VYCE_POLL_INTERVAL": ("poll_interval", "float"),
+    "VYCE_MIN_REQUEST_INTERVAL": ("min_request_interval", "float"),
+    "VYCE_SERVER_NAME": ("server_name", "str"),
+    "VYCE_OS": ("os", "str"),
+    "VYCE_REGION": ("region_allow", "list"),
+    "VYCE_REGION_PREFERENCE": ("region_preference", "list"),
+    "VYCE_KEY_IDS": ("key_ids", "list"),
+    "VYCE_MAX_WAIT": ("max_deploy_wait_seconds", "int"),
+    "VYCE_WATCH_SECONDS": ("watch_seconds", "int"),
+    "VYCE_CAPTCHA_SOLVER": ("captcha_solver", "bool"),
+    "VYCE_CHROME_BIN": ("captcha_chrome_bin", "str"),
+    "VYCE_CAPTCHA_SOLVE_TIMEOUT": ("captcha_solve_timeout", "int"),
+}
+
+_ENV_PARSERS = {"str": _env_str, "int": _env_int, "float": _env_float,
+                "bool": _env_bool, "list": _env_list}
+
+
+def env_overrides(environ: dict | None = None) -> dict:
+    """从 VYCE_* 环境变量读出配置覆盖项。空值视为未设置，方便 CI 里直接引用 vars。"""
+    env = os.environ if environ is None else environ
+    out: dict = {}
+    for name, (key, kind) in ENV_CONFIG_MAP.items():
+        raw = (env.get(name) or "").strip()
+        if not raw:
+            continue
+        out[key] = _ENV_PARSERS[kind](name, raw)
+    return out
+
+
 def load_config() -> dict:
+    """优先级：DEFAULTS < config.json < VYCE_* 环境变量。命令行参数在 main() 里再覆盖一层。"""
     cfg = dict(DEFAULTS)
     if CONFIG_PATH.exists():
         try:
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except json.JSONDecodeError as exc:
             die(f"config.json 解析失败：{exc}")
+    cfg.update(env_overrides())
     return cfg
 
 
@@ -117,7 +188,7 @@ def load_cookie() -> str:
     return raw
 
 
-def die(msg: str, code: int = 1) -> None:
+def die(msg: str, code: int = 1) -> "NoReturn":
     print(f"[x] {msg}", file=sys.stderr)
     raise SystemExit(code)
 
@@ -961,10 +1032,14 @@ def cmd_renew(api: Api, cfg: dict, args) -> int:
 
 def cmd_watch(api: Api, cfg: dict, args) -> int:
     interval = max(1.0, float(args.interval or cfg["poll_interval"]))
+    seconds = int(args.seconds or cfg.get("watch_seconds") or 0)
     cookie = load_cookie()
     auto = bool(args.deploy) and bool(cookie) and not args.dry_run
     if args.deploy and not cookie:
-        warn("没有 session.txt，无法下单；本次退化为只读监听")
+        # 显式要下单却没有会话，几乎都是配置漏了（CI 里就是 secret 没填）。
+        # 静默退化成只读会让 job 一直绿着却不干事，这里直接失败更好排查。
+        die("--deploy 需要会话，但既没有 session.txt 也没有 VYCE_COOKIE；"
+            "只想只读监听就不要加 --deploy", code=2)
     pref: list[str] = []
     allow: list[str] = []
     if auto:
@@ -984,7 +1059,7 @@ def cmd_watch(api: Api, cfg: dict, args) -> int:
         warn("--renew 需要 session.txt，本次不续期")
     try:
         while True:
-            if args.seconds and time.monotonic() - started >= args.seconds:
+            if seconds and time.monotonic() - started >= seconds:
                 break
             t0 = time.monotonic()
             try:
@@ -1155,6 +1230,25 @@ def cmd_solver_check(cfg: dict, args) -> int:
     return 0
 
 
+def cmd_check_free(api: Api) -> int:
+    """CI 用探针：账号里有免费机 → exit 0（该跳过抢机）；没有 → exit 1。"""
+    try:
+        servers = fetch_servers(api)
+    except ApiError as exc:
+        if exc.status == 401:
+            die("会话已失效（Cookie 过期或被顶），请重新导出 VYCE_COOKIE")
+        die(f"查询服务器列表失败：{exc}")
+    free = [s for s in servers if s.get("source") == "free"]
+    if not free:
+        info("账号下没有免费机")
+        return 1
+    for srv in free:
+        exp = srv.get("expiresAt")
+        exp_str = ts(datetime.fromtimestamp(exp / 1000, TZ)) if isinstance(exp, (int, float)) else "-"
+        info(f"{srv.get('name') or srv.get('id')}  {srv.get('status')}  到期 {exp_str}")
+    return 0
+
+
 def cmd_stats(cfg: dict) -> int:
     if not STOCK_LOG.exists():
         info("还没有 data/stock.jsonl，先跑一段时间 watch")
@@ -1235,6 +1329,7 @@ def main(argv: list[str] | None = None) -> int:
                        help="本次不走无头浏览器过验证码（只用 /start 兜底）")
     p_sol = sub.add_parser("solver-check", help="检查验证码求解链路是否可用")
     p_sol.add_argument("--solve", action="store_true", help="真去站点取一个 token（不提交续期）")
+    sub.add_parser("check-free", help="账号是否已有免费机（有=exit 0，无=exit 1）")
     sub.add_parser("stats", help="统计 data/stock.jsonl 里的放号规律")
 
     args = parser.parse_args(argv)
@@ -1267,6 +1362,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_deploy(api, cfg, args)
         if args.cmd == "renew":
             return cmd_renew(api, cfg, args)
+        if args.cmd == "check-free":
+            return cmd_check_free(api)
     except ApiError as exc:
         die(f"{exc}（HTTP {exc.status}）{json.dumps(exc.payload, ensure_ascii=False)[:300]}")
     return 2

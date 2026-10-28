@@ -1,0 +1,33 @@
+name: test
+
+# 纯离线单元测试：不联网、不需要 Cookie，push/PR 就跑。
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 语法检查
+        run: python -m py_compile src/vyce.py tests/*.py
+
+      - name: 单元测试
+        run: python -m unittest discover -s tests -v 2>&1 | tail -n 80
+
+      - name: 求解脚本语法
+        run: node --check tools/bestcap_solver.mjs

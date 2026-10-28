@@ -1,0 +1,110 @@
+name: renew
+
+# 免费机续期。站点规则：满 24 小时才进续期窗口，一续加 48 小时。
+# 每 6 小时跑一次，既能在窗口一开就续，也不至于打太频繁。
+#
+# 注意：续期接口现在要求 Bestcap 验证码。job 里用无头 Chrome 走官方控件自动通过；
+# ubuntu-latest 自带 node 与 google-chrome，通常不需要额外安装。
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "无视 24 小时冷却，强制尝试续期"
+        type: boolean
+        required: false
+        default: false
+      dry_run:
+        description: "只判断状态，不提交"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: vyce-renew
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VYCE_COOKIE: ${{ secrets.VYCE_COOKIE }}
+      VYCE_CAPTCHA_SOLVER: ${{ vars.VYCE_CAPTCHA_SOLVER || 'true' }}
+      VYCE_CAPTCHA_SOLVE_TIMEOUT: ${{ vars.VYCE_CAPTCHA_SOLVE_TIMEOUT || '180' }}
+      VYCE_CHROME_BIN: ${{ vars.VYCE_CHROME_BIN }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 确认 node 与浏览器（验证码需要）
+        run: |
+          node -v || { echo "::error::缺少 node 18+，无法过验证码。"; exit 1; }
+          if command -v google-chrome >/dev/null 2>&1; then
+            google-chrome --version
+          elif command -v chromium >/dev/null 2>&1; then
+            chromium --version
+          elif command -v chromium-browser >/dev/null 2>&1; then
+            chromium-browser --version
+          else
+            echo "::warning::镜像里没有浏览器，尝试安装 chromium"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq chromium-browser || sudo apt-get install -y -qq chromium || true
+            command -v chromium chromium-browser || echo "::error::装不上浏览器，续期会退化成 /start 兜底或失败"
+          fi
+
+      - name: 求解链路自检
+        run: python src/vyce.py solver-check
+
+      - name: 续期
+        id: renew
+        run: |
+          set +e
+          args=()
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then args+=(--force); fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then args+=(--dry-run); fi
+          python src/vyce.py renew "${args[@]}" 2>&1 | tee renew.log
+          code=${PIPESTATUS[0]}
+          set -e
+          # 0 = 全部成功或无需续期；1 = 有机器续期失败（含验证码过不去），要让 job 红
+          exit "$code"
+
+      - name: 续期后复核
+        if: always()
+        run: |
+          {
+            echo "## vyce renew"
+            echo ""
+            echo "- 时间：$(date -u '+%Y-%m-%d %H:%M:%SZ')"
+            echo ""
+            echo "### 状态"
+            echo '```'
+            python src/vyce.py status 2>&1 | tail -n 20
+            echo '```'
+            if [ -f renew.log ]; then
+              echo "### 续期日志"
+              echo '```'
+              tail -n 60 renew.log
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 保留日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renew-log-${{ github.run_id }}
+          path: |
+            renew.log
+            data/
+          if-no-files-found: ignore
+          retention-days: 7

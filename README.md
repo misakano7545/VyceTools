@@ -67,6 +67,7 @@ python src/vyce.py watch --deploy --dry-run # 演练：只打印将要提交的�
 | `deploy [--dry-run] [--region R] [--any-region]` | 名额已开放时手动下单一次 |
 | `renew [--force] [--dry-run] [--loop] [--interval N] [--no-solver]` | 免费机续期；`--loop` 常驻守护（默认 30 分钟一轮）；验证码自动兜底 |
 | `solver-check [--solve]` | 检查验证码求解链路；`--solve` 真取一个 token（不提交续期） |
+| `check-free` | 账号是否已有免费机：有 → exit 0，没有 → exit 1（CI 用来决定是否抢） |
 | `stats` | 汇总放号时段分布与最近记录 |
 
 ## 自定义区域
@@ -121,6 +122,58 @@ python src/vyce.py watch --deploy --any-region
 - `key_ids`：留空 = 用账号里所有已登记公钥
 - `server_name`：3–24 位小写字母/数字/连字符（站点正则）
 - `region_allow`：严格白名单，`[]` = 不限区域
+
+## 环境变量（CI / 容器用）
+
+优先级：**命令行参数 > `VYCE_*` 环境变量 > `config.json` > 内置默认值**。
+GitHub Actions 里没有 `config.json` 和 `session.txt`，全靠环境变量。
+
+| 变量 | 对应配置 | 说明 |
+|---|---|---|
+| `VYCE_COOKIE` | （会话） | 整行 Cookie。CI 里放 **Secrets**，本地也可用 |
+| `VYCE_REGION` | `region_allow` | 严格白名单，逗号分隔，认别名 `eu/asia/us` |
+| `VYCE_REGION_PREFERENCE` | `region_preference` | 仅排序，不限制范围 |
+| `VYCE_POLL_INTERVAL` | `poll_interval` | 轮询间隔秒 |
+| `VYCE_WATCH_SECONDS` | `watch_seconds` | `watch` 跑多久后退出（0 = 一直跑） |
+| `VYCE_SERVER_NAME` | `server_name` | 机器名 |
+| `VYCE_OS` | `os` | 系统，可写 `ubuntu-24` 或 `Ubuntu 24.04` |
+| `VYCE_KEY_IDS` | `key_ids` | 逗号分隔，留空 = 全部已登记公钥 |
+| `VYCE_MAX_WAIT` | `max_deploy_wait_seconds` | 建机最长等待秒数 |
+| `VYCE_CAPTCHA_SOLVER` | `captcha_solver` | `1/0`，续期是否走无头浏览器过验证码 |
+| `VYCE_CHROME_BIN` | `captcha_chrome_bin` | 自定义浏览器路径（CI 镜像里路径不一致时用） |
+| `VYCE_CAPTCHA_SOLVE_TIMEOUT` | `captcha_solve_timeout` | 求解超时秒数 |
+| `VYCE_BASE_URL` | `base_url` | 换测试环境用 |
+| `VYCE_MIN_REQUEST_INTERVAL` | `min_request_interval` | 最小请求间隔 |
+
+空值视为未设置（方便在 workflow 里直接引用可能为空的 `vars`）。值写错会**点名报错**并退出 1，
+不会静默用默认值——CI 里更怕的是"跑着但没生效"。
+
+## GitHub Actions
+
+仓库自带两个 workflow，`.github/workflows/`：
+
+| 文件 | 触发 | 干什么 |
+|---|---|---|
+| `grab.yml` | 每 5 分钟 + 手动 | 先 `check-free`，没有免费机才持续轮询约 4 分半并在放号时下单 |
+| `renew.yml` | 每 6 小时 + 手动 | 续期；验证码用无头 Chrome 过（镜像自带 node 与 chrome） |
+
+### 需要配的东西
+
+**Settings → Secrets and variables → Actions**
+
+- Secrets：`VYCE_COOKIE`（必填，整行 Cookie）
+- Variables（都可选）：`VYCE_REGION`、`VYCE_POLL_INTERVAL`、`VYCE_WATCH_SECONDS`、
+  `VYCE_SERVER_NAME`、`VYCE_OS`、`VYCE_KEY_IDS`、`VYCE_CAPTCHA_SOLVER`
+
+### 设计说明
+
+- **为什么每 5 分钟**：GitHub 的 `cron` 最短就是 5 分钟。所以不是每 5 分钟只查一次，而是
+  **每个 job 内部持续轮询 270 秒**，两次 job 首尾几乎相接，实际接近连续监听。
+- **`concurrency` 锁**：抢机和续期各自一个 group，避免自己跟自己抢名额、或重复请求。
+- **退出码语义**：`check-free` 有免费机 → 0（跳过抢机）/ 没有 → 1（去抢）；
+  `watch` 正常跑完 → 0；要下单却没配 Cookie → 2（直接失败，不会静默退化成只读）。
+- **日志**：每轮把最后 40 行写进 job summary，并上传 `grab.log` / `renew.log` / `data/` 作 artifact（保留 7 天）。
+- **Cookie 会过期**：站点会话是 GitHub OAuth 的，失效后 job 会以 401 失败并提示重新导出。没有自动刷新机制。
 
 ## 设计边界（重要）
 

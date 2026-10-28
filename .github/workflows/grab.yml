@@ -1,0 +1,134 @@
+name: grab
+
+# 抢免费名额。GitHub 的 cron 最短粒度是 5 分钟，而放号窗口可能只有几十秒，
+# 所以策略是「每 5 分钟拉起一次，每次在 job 里持续轮询约 4 分半」——
+# 两次 job 首尾几乎相接，实际覆盖接近连续监听。
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "限定区域，逗号分隔（Europe/Asia/USA 或别名 eu/asia/us），留空用仓库变量"
+        required: false
+        default: ""
+      seconds:
+        description: "本次轮询多少秒（默认 270）"
+        required: false
+        default: "270"
+
+# 同一时刻只允许一个抢机 job：两个 job 并发会互相抢同一批名额，还容易触发限流
+concurrency:
+  group: vyce-grab
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # ---- 敏感信息：仓库 Secrets ----
+      VYCE_COOKIE: ${{ secrets.VYCE_COOKIE }}
+      # ---- 普通配置：仓库 Variables（Settings → Secrets and variables → Actions → Variables）----
+      VYCE_REGION: ${{ github.event.inputs.region || vars.VYCE_REGION }}
+      VYCE_POLL_INTERVAL: ${{ vars.VYCE_POLL_INTERVAL || '3' }}
+      VYCE_WATCH_SECONDS: ${{ github.event.inputs.seconds || vars.VYCE_WATCH_SECONDS || '270' }}
+      VYCE_SERVER_NAME: ${{ vars.VYCE_SERVER_NAME || 'vyce-mini' }}
+      VYCE_OS: ${{ vars.VYCE_OS || 'ubuntu-24' }}
+      VYCE_KEY_IDS: ${{ vars.VYCE_KEY_IDS }}
+      VYCE_CAPTCHA_SOLVER: ${{ vars.VYCE_CAPTCHA_SOLVER || 'true' }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 依赖自检（抢机本身只要标准库）
+        run: |
+          python -V
+          node -v || echo "::warning::没有 node，续期相关功能不可用（抢机不受影响）"
+          (google-chrome --version || chromium --version || chromium-browser --version) \
+            || echo "::warning::没有 Chrome/Chromium，续期相关功能不可用（抢机不受影响）"
+
+      - name: 检查会话是否有效
+        run: |
+          if [ -z "$VYCE_COOKIE" ]; then
+            echo "::error::没有配置 VYCE_COOKIE。到 Settings → Secrets and variables → Actions 添加 secret。"
+            exit 1
+          fi
+          python src/vyce.py auth-check
+
+      - name: 已有免费机就跳过（ToS 一人一台）
+        id: guard
+        run: |
+          set +e
+          python src/vyce.py check-free
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::账号已有免费机，本次不抢。"
+          elif [ "$code" -eq 1 ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::check-free 异常退出（$code）"
+            exit "$code"
+          fi
+
+      - name: 抢机（持续轮询）
+        id: grab
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          set +e
+          python src/vyce.py watch --deploy \
+            --interval "$VYCE_POLL_INTERVAL" \
+            --seconds "$VYCE_WATCH_SECONDS" 2>&1 | tee grab.log
+          code=${PIPESTATUS[0]}
+          set -e
+          # watch 正常跑完就是 0。非 0 说明出事了（会话失效、参数错误等），让 job 红起来。
+          if [ "$code" -ne 0 ]; then
+            echo "::error::watch 退出码 $code"
+            exit "$code"
+          fi
+          if grep -q '下单返回 id=' grab.log; then
+            echo "::notice::本次抢到机器，见日志与面板。"
+            echo "grabbed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::本次没有名额或没抢到，下一轮继续（每 5 分钟）。"
+          fi
+
+      - name: 写 job summary
+        if: always()
+        run: |
+          {
+            echo "## vyce grab"
+            echo ""
+            echo "- 区域：\`${VYCE_REGION:-（不限）}\`"
+            echo "- 轮询：每 ${VYCE_POLL_INTERVAL}s，共 ${VYCE_WATCH_SECONDS}s"
+            echo "- 时间：$(date -u '+%Y-%m-%d %H:%M:%SZ')"
+            echo ""
+            if [ -f grab.log ]; then
+              echo '```'
+              tail -n 40 grab.log
+              echo '```'
+            else
+              echo "_本次未进入抢机步骤_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 保留日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grab-log-${{ github.run_id }}
+          path: |
+            grab.log
+            data/stock.jsonl
+          if-no-files-found: ignore
+          retention-days: 7
