@@ -65,7 +65,8 @@ python src/vyce.py watch --deploy --dry-run # 演练：只打印将要提交的�
 | `auth-check` | 验证 `session.txt` 的 Cookie 与账号资格（GitHub 龄、SSH key） |
 | `key-add [--pub PATH] [--name N]` | 把本地公钥登记到账号（建机前置） |
 | `deploy [--dry-run] [--region R] [--any-region]` | 名额已开放时手动下单一次 |
-| `renew [--force] [--dry-run] [--loop] [--interval N]` | 免费机续期；`--loop` 常驻守护（默认 30 分钟一轮） |
+| `renew [--force] [--dry-run] [--loop] [--interval N] [--no-solver]` | 免费机续期；`--loop` 常驻守护（默认 30 分钟一轮）；验证码自动兜底 |
+| `solver-check [--solve]` | 检查验证码求解链路；`--solve` 真取一个 token（不提交续期） |
 | `stats` | 汇总放号时段分布与最近记录 |
 
 ## 自定义区域
@@ -125,7 +126,8 @@ python src/vyce.py watch --deploy --any-region
 
 - **单账号、单机**：ToS 规定一人一号、一个免费实例；工具下单前会检查是否已有 `source=free` 的机器，有则拒绝。
 - **自动续期已实现（M2，按用户要求）**：面板 Renew 按钮是「先弹广告再调接口」，但 `/api/servers/{id}/renew` 本身不校验广告令牌——广告门是纯前端 `sessionStorage` 逻辑。本工具直接调接口，因此**不会产生广告曝光**。这是本工具唯一一处明确绕开站点变现路径的行为，风险自担；服务端若将来加校验，工具会收到 4xx 并如实报错，不会伪装成功。
-  - ⚠️ **2026-10 站点已加上 BestCap 验证码**：`POST /renew` 现在要带 `captchaResponse`，脚本无法生成 → **自动续期已失效**。工具会把这种情况单独识别（不重试、不伪装成功），并提示去面板手动点 Renew。抢机（新建）不受影响，body 里没有 captcha 字段。
+  - ⚠️ **2026-10 站点已加上 BestCap 验证码**：`POST /renew` 现在要带 `captchaResponse`。伪造 token 不可行（随机化 WASM 工作量证明 + 服务端校验请求侧特征），但**可以让官方控件自己算**：工具内置 `tools/bestcap_solver.mjs`（取自 [dengyie/vycebump](https://github.com/dengyie/vycebump)，MIT），用无头 Chrome + CDP 点过勾选框并在同一会话内提交续期，本机实测 12.5s 拿到 token。兜底顺序：`stopped`/已过期先试 `POST /start`（免验证码），否则走浏览器求解，都失败才提示手动。抢机（新建）不受影响。
+  - ⚠️ 因此**自动续期需要额外依赖**：Node 18+ 与 Chrome/Chromium/Edge。抢机路径仍是纯标准库。用 `solver-check --solve` 可单独验证链路。
 - **不轰炸**：默认 2s 轮询 ≈ 30 次/分钟，是站点 300 次/分钟限流的 10%；遇 429 按 `x-ratelimit-reset` 退避。
 - **不碰账号体系**：不代注册、不绕 30 天账号限制、不多开、不并发多 IP。
 

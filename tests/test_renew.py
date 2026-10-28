@@ -196,7 +196,7 @@ class CaptchaDetectTest(unittest.TestCase):
         self.assertFalse(vyce.is_captcha_error(400, "Invalid UUID"))
         self.assertFalse(vyce.is_captcha_error(500, "captcha"))
 
-    def test_renew_stops_retrying_and_says_manual(self):
+    def test_renew_explains_when_solver_disabled(self):
         old = free_server(47 * HOUR)
 
         class CapApi(FakeApi):
@@ -208,16 +208,103 @@ class CaptchaDetectTest(unittest.TestCase):
                                           "message": "Please complete the CAPTCHA verification first."})
 
         api = CapApi([[]])
-        failures, out = vyce_capture(api)
+        # captcha_solver=False 时必须立刻停手，绝不允许测试去启动真实浏览器
+        failures, out = vyce_capture(api, {"captcha_solver": False})
         self.assertEqual(failures, 1)
         self.assertIn("验证码", out)
         self.assertIn("面板手动", out)
+        self.assertIn("captcha_solver=false", out)
 
 
-def vyce_capture(api):
+class UnblockRoutingTest(unittest.TestCase):
+    """验证码拦住后走哪条免人工路径：停机/过期 → /start；运行中 → 浏览器求解。"""
+
+    def setUp(self):
+        self._old = vyce.solve_captcha_and_renew
+        self.calls = []
+
+    def tearDown(self):
+        vyce.solve_captcha_and_renew = self._old
+
+    def _fake_solver(self, ok, detail="solver-ran"):
+        def fake(api, cfg, sid, cookie):
+            self.calls.append(("solver", sid))
+            return ok, detail
+        vyce.solve_captcha_and_renew = fake
+
+    def _api(self):
+        holder = {}
+
+        class Rec(FakeApi):
+            def request(self, method, path, body=None, retries=2):
+                holder["last"] = (method, path, body)
+                return {}, {}
+
+        return Rec([[]]), holder
+
+    def test_stopped_server_uses_start_not_solver(self):
+        self._fake_solver(True)
+        api, holder = self._api()
+        how, detail = vyce.unblock_renewal(api, {}, "srv-1", "stopped", "c=1")
+        self.assertEqual(how, "start")
+        self.assertEqual(holder["last"][:2], ("POST", "/api/servers/srv-1/start"))
+        self.assertEqual(holder["last"][2], {}, "power action 的 body 必须是 {}")
+        self.assertFalse([c for c in self.calls if c[0] == "solver"], "不该白跑一次浏览器")
+
+    def test_expired_server_uses_start(self):
+        self._fake_solver(True)
+        api, _ = self._api()
+        how, _d = vyce.unblock_renewal(api, {}, "srv-1", "late", "c=1")
+        self.assertEqual(how, "start")
+
+    def test_running_server_goes_to_solver(self):
+        self._fake_solver(True, "浏览器内续期返回 200")
+        api, holder = self._api()
+        how, detail = vyce.unblock_renewal(api, {}, "srv-1", "ok", "c=1")
+        self.assertEqual(how, "solver")
+        self.assertIn("200", detail)
+        self.assertNotIn("last", holder, "运行中的机器不该走 /start")
+
+    def test_start_failure_falls_back_to_solver(self):
+        self._fake_solver(True)
+
+        class BadStart(FakeApi):
+            def request(self, method, path, body=None, retries=2):
+                raise vyce.ApiError(409, {"error": "conflict", "message": "server is running"})
+
+        how, _d = vyce.unblock_renewal(BadStart([[]]), {}, "srv-1", "stopped", "c=1")
+        self.assertEqual(how, "solver")
+
+    def test_all_paths_failing_returns_none(self):
+        self._fake_solver(False, "找不到 Chrome")
+        api, _ = self._api()
+        how, detail = vyce.unblock_renewal(api, {}, "srv-1", "ok", "c=1")
+        self.assertIsNone(how)
+        self.assertIn("Chrome", detail)
+
+
+class SolverOutputTest(unittest.TestCase):
+    def test_parses_token_and_renew(self):
+        out = 'TOKEN:bc1.abcdefghijklmnopqrstuvwxyz\nRENEW:{"status":200,"body":"{\\"ok\\":true}"}\n'
+        token, renew = vyce.parse_solver_output(out)
+        self.assertTrue(token.startswith("bc1."))
+        self.assertEqual(renew["status"], 200)
+
+    def test_parses_token_only(self):
+        token, renew = vyce.parse_solver_output("TOKEN:bc1.xyz")
+        self.assertEqual(token, "bc1.xyz")
+        self.assertIsNone(renew)
+
+    def test_ignores_garbage(self):
+        token, renew = vyce.parse_solver_output("BESTCAP:retry 1\nRENEW:not-json\n")
+        self.assertEqual(token, "")
+        self.assertIsNone(renew)
+
+
+def vyce_capture(api, cfg=None):
     buf = io.StringIO()
     with redirect_stdout(buf):
-        failures = vyce.renew_once(api, {}, force=True)
+        failures = vyce.renew_once(api, cfg or {}, force=True)
     return failures, buf.getvalue()
 
 

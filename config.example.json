@@ -7,5 +7,8 @@
   "region_preference": ["Europe", "Asia", "USA"],
   "region_allow": [],
   "key_ids": [],
-  "max_deploy_wait_seconds": 600
+  "max_deploy_wait_seconds": 600,
+  "captcha_solver": true,
+  "captcha_chrome_bin": "",
+  "captcha_solve_timeout": 150
 }

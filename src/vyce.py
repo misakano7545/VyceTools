@@ -17,9 +17,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
+import shutil
+import socket
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -66,6 +71,9 @@ DEFAULTS = {
     "key_ids": [],
     "auto_deploy": False,
     "max_deploy_wait_seconds": 600,
+    "captcha_solver": True,
+    "captcha_chrome_bin": "",
+    "captcha_solve_timeout": 150,
 }
 
 # 区域别名：站点 id 是 Europe / Asia / USA（取自 /api/stock 的 regions[].id），
@@ -420,6 +428,182 @@ def is_captcha_error(status: int, msg: str) -> bool:
     ))
 
 
+def power_action(api: Api, sid: str, action: str) -> dict:
+    """POST /api/servers/{id}/{action}，action ∈ start/stop/restart。body 必须是 {}。"""
+    payload, _ = api.request("POST", f"/api/servers/{sid}/{action}", {})
+    return payload or {}
+
+
+# ---------------------------------------------------------------- Bestcap 求解
+
+SOLVER_SCRIPT = ROOT / "tools" / "bestcap_solver.mjs"
+CHROME_CANDIDATES = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+]
+
+
+def find_browser(cfg: dict) -> str | None:
+    explicit = str(cfg.get("captcha_chrome_bin") or "").strip()
+    if explicit:
+        return explicit if Path(explicit).expanduser().is_file() else None
+    local = os.environ.get("CHROME_BIN", "").strip()
+    if local and Path(local).is_file():
+        return local
+    for cand in CHROME_CANDIDATES:
+        if Path(cand).is_file():
+            return cand
+    return None
+
+
+def solver_readiness(cfg: dict) -> tuple[bool, str]:
+    """检查求解链路的三个外部依赖是否就位。"""
+    if not bool(cfg.get("captcha_solver", True)):
+        return False, "captcha_solver=false（配置里关掉了自动求解）"
+    if not SOLVER_SCRIPT.is_file():
+        return False, f"缺少求解脚本 {SOLVER_SCRIPT}"
+    if not shutil.which("node"):
+        return False, "PATH 里找不到 node（求解脚本需要 Node 18+）"
+    chrome = find_browser(cfg)
+    if not chrome:
+        return False, "找不到 Chrome/Chromium，可用 config.captcha_chrome_bin 指定"
+    return True, chrome
+
+
+def parse_solver_output(stdout: str) -> tuple[str, dict | None]:
+    """从求解器 stdout 里取 (token, renew 结果)。"""
+    token, renew = "", None
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("TOKEN:"):
+            token = line[len("TOKEN:"):].strip()
+        elif line.startswith("RENEW:"):
+            try:
+                renew = json.loads(line[len("RENEW:"):])
+            except json.JSONDecodeError:
+                renew = None
+    return token, renew
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _wait_cdp(port: int, proc: "subprocess.Popen", timeout: float = 25.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return False
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2):
+                return True
+        except Exception:
+            time.sleep(0.3)
+    return False
+
+
+def _run_solver(cfg: dict, sitekey: str, cookie: str, sid: str = "") -> tuple[str, dict | None, str]:
+    """起无头 Chrome + 跑求解脚本，返回 (token, renew 回执, 错误)。sid 为空则只求 token。"""
+    ready, detail = solver_readiness(cfg)
+    if not ready:
+        return "", None, detail
+    chrome = detail
+    node = shutil.which("node") or ""
+
+    port = _free_port()
+    profile = tempfile.mkdtemp(prefix="vyce-chrome-")
+    base = str(cfg.get("base_url") or DEFAULTS["base_url"]).rstrip("/")
+    proc = None
+    try:
+        args = [chrome, "--headless=new", "--disable-gpu", "--disable-extensions",
+                "--disable-background-networking", "--disable-sync", "--no-first-run",
+                "--no-default-browser-check", "--mute-audio",
+                f"--user-data-dir={profile}", f"--remote-debugging-port={port}", "about:blank"]
+        if sys.platform.startswith("linux"):
+            args += ["--no-sandbox", "--disable-dev-shm-usage"]
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not _wait_cdp(port, proc):
+            return "", None, "Chrome 调试端口没起来"
+
+        env = dict(os.environ)
+        env["VYCE_COOKIE"] = cookie
+        cmd = [node, str(SOLVER_SCRIPT), f"http://127.0.0.1:{port}", sitekey, base]
+        if sid:
+            cmd.append(sid)
+        run = subprocess.run(cmd, capture_output=True, text=True,
+                             timeout=int(cfg.get("captcha_solve_timeout", 150)), env=env)
+        token, renew = parse_solver_output(run.stdout or "")
+        if run.returncode != 0 and not token:
+            tail = (run.stderr or run.stdout or "").strip().splitlines()
+            return "", None, (tail[-1] if tail else f"求解器退出码 {run.returncode}")
+        if not token:
+            return "", None, "求解器没吐 token"
+        return token, renew, ""
+    except subprocess.TimeoutExpired:
+        return "", None, "求解超时"
+    except (OSError, ValueError) as exc:
+        return "", None, f"求解器无法启动：{exc}"
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+def solve_captcha_and_renew(api: Api, cfg: dict, sid: str, cookie: str) -> tuple[bool, str]:
+    """用无头 Chrome 过 Bestcap，并在同一浏览器会话内提交续期。
+
+    返回 (是否提交成功, 说明)。真正的续期结果仍由调用方回读 expiresAt 判定。
+    """
+    sitekey = ""
+    try:
+        snap, _ = api.request("GET", "/api/config")
+        sitekey = str((snap or {}).get("bestcapSitekey") or "")
+    except ApiError:
+        pass  # 求解器自带默认 sitekey，取不到也能试
+
+    token, renew, err = _run_solver(cfg, sitekey, cookie, sid)
+    if err:
+        return False, err
+    if renew is None:
+        return False, "拿到 token 但浏览器内续期没有回执"
+    status = renew.get("status")
+    body = str(renew.get("body") or "")[:200]
+    if isinstance(status, int) and 200 <= status < 300:
+        return True, f"浏览器内续期返回 {status}"
+    return False, f"浏览器内续期 HTTP {status}: {body}"
+
+
+def unblock_renewal(api: Api, cfg: dict, sid: str, kind: str, cookie: str) -> tuple[str | None, str]:
+    """续期被验证码拦住后，试两条免人工路径，返回 (路径, 说明)。
+
+    start：机器已停机或已过期时，POST /start 在站点语义里就是
+    「Renew and start」，不需要验证码（参考 vycebump 的实现说明）。
+    solver：机器还在运行、只是要提前续期，只能用无头浏览器过验证码。
+    """
+    if kind in ("stopped", "late"):
+        try:
+            power_action(api, sid, "start")
+            return "start", "已调用 POST /start（Renew and start）"
+        except ApiError as exc:
+            info(f"    /start 兜底失败（{exc}），改用浏览器求解")
+    ok_solver, detail = solve_captcha_and_renew(api, cfg, sid, cookie)
+    if ok_solver:
+        return "solver", detail
+    return None, detail
+
+
 def renew_once(api: Api, cfg: dict, force: bool = False, dry_run: bool = False) -> int:
     """检查并续期所有免费机。返回失败数量。"""
     servers = fetch_servers(api)
@@ -470,13 +654,18 @@ def renew_once(api: Api, cfg: dict, force: bool = False, dry_run: bool = False) 
         except ApiError as exc:
             msg = str(exc)
             if is_captcha_error(exc.status, msg) or (exc.status == 400 and "captcha" in msg.lower()):
-                warn("    续期已被站点验证码拦住（BestCap）：POST /renew 现在要求 captchaResponse，"
-                     "本工具无解，请到面板手动点 Renew")
-                state[sid] = {"name": name, "status": "captcha_required", "msg": msg,
-                              "last_check_ts": now_ms}
-                failures += 1
-                continue
-            if is_cooldown_error(exc.status, msg):
+                info(f"    站点要求验证码（{msg}），尝试免人工续期……")
+                how, detail = unblock_renewal(api, cfg, str(sid), kind,
+                                              getattr(api, "cookie", "") or load_cookie())
+                if how is None:
+                    warn(f"    验证码无法自动通过：{detail}。请到面板手动点 Renew")
+                    state[sid] = {"name": name, "status": "captcha_required", "msg": msg,
+                                  "detail": detail, "last_check_ts": now_ms}
+                    failures += 1
+                    continue
+                ok(f"    {detail}，回读确认……")
+                msg = detail
+            elif is_cooldown_error(exc.status, msg):
                 m = re.search(r"wait\s+(\d+)\s+more\s+hour", msg, re.IGNORECASE)
                 wait_ms = int(m.group(1)) * HOUR_MS if m else st.get("cooldownLeft") or DAY_MS
                 info(f"    服务端仍报冷却（{msg}），等 {fmt_dur(wait_ms)}")
@@ -936,6 +1125,36 @@ def cmd_deploy(api: Api, cfg: dict, args) -> int:
     return 0 if result else 3
 
 
+def cmd_solver_check(cfg: dict, args) -> int:
+    """诊断验证码求解链路；--solve 才会真去求一个 token（不提交续期）。"""
+    ready, detail = solver_readiness(cfg)
+    print(f"求解脚本   : {SOLVER_SCRIPT}（{'存在' if SOLVER_SCRIPT.is_file() else '缺失'}）")
+    print(f"node       : {shutil.which('node') or '未找到'}")
+    print(f"浏览器     : {detail if ready else '未找到'}")
+    if not ready:
+        warn(f"不可用：{detail}")
+        return 1
+    ok("三项依赖齐备")
+    if not args.solve:
+        info("只做依赖检查；加 --solve 会真的去站点取一个 token（不提交续期）")
+        return 0
+
+    sitekey = ""
+    try:
+        payload, _ = Api(str(cfg.get("base_url") or DEFAULTS["base_url"]), "").request("GET", "/api/config")
+        sitekey = str((payload or {}).get("bestcapSitekey") or "")
+    except ApiError as exc:
+        warn(f"取 sitekey 失败（{exc}），用求解器内置默认值")
+    info(f"sitekey={sitekey or '（内置默认）'}，开始求解……")
+    t0 = time.time()
+    token, renew, err = _run_solver(cfg, sitekey, "", "")
+    if err:
+        warn(f"求解失败：{err}")
+        return 1
+    ok(f"拿到 token：{len(token)} 字节，{time.time() - t0:.1f}s，前缀 {token[:10]}…")
+    return 0
+
+
 def cmd_stats(cfg: dict) -> int:
     if not STOCK_LOG.exists():
         info("还没有 data/stock.jsonl，先跑一段时间 watch")
@@ -1012,6 +1231,10 @@ def main(argv: list[str] | None = None) -> int:
     p_ren.add_argument("--loop", action="store_true", help="常驻守护，按间隔反复检查")
     p_ren.add_argument("--interval", type=int, default=1800, help="守护模式检查间隔秒（默认 1800）")
     p_ren.add_argument("--seconds", type=int, default=0, help="守护模式总共跑多少秒，0=一直跑")
+    p_ren.add_argument("--no-solver", action="store_true",
+                       help="本次不走无头浏览器过验证码（只用 /start 兜底）")
+    p_sol = sub.add_parser("solver-check", help="检查验证码求解链路是否可用")
+    p_sol.add_argument("--solve", action="store_true", help="真去站点取一个 token（不提交续期）")
     sub.add_parser("stats", help="统计 data/stock.jsonl 里的放号规律")
 
     args = parser.parse_args(argv)
@@ -1023,6 +1246,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "stats":
         return cmd_stats(cfg)
+    if args.cmd == "solver-check":
+        return cmd_solver_check(cfg, args)
+    if getattr(args, "no_solver", False):
+        cfg["captcha_solver"] = False
 
     api = Api(cfg["base_url"], load_cookie(),
               min_interval=cfg.get("min_request_interval", 1.0))
