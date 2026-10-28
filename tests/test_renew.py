@@ -181,5 +181,45 @@ class CooldownDetectTest(unittest.TestCase):
         self.assertFalse(vyce.is_cooldown_error(500, "renewal_cooldown"))
 
 
+class CaptchaDetectTest(unittest.TestCase):
+    """2026-10 起 /renew 需要 BestCap 的 captchaResponse，必须与冷却/限流区分开。"""
+
+    def test_detection(self):
+        self.assertTrue(vyce.is_captcha_error(400, "captcha_required"))
+        self.assertTrue(vyce.is_captcha_error(400, "Invalid CAPTCHA response"))
+        self.assertTrue(vyce.is_captcha_error(403, "verification failed"))
+        self.assertTrue(vyce.is_captcha_error(422, "bestcap token expired"))
+
+    def test_not_confused_with_cooldown_or_limit(self):
+        self.assertFalse(vyce.is_captcha_error(429, "renewal_cooldown"))
+        self.assertFalse(vyce.is_captcha_error(429, "rate limited"))
+        self.assertFalse(vyce.is_captcha_error(400, "Invalid UUID"))
+        self.assertFalse(vyce.is_captcha_error(500, "captcha"))
+
+    def test_renew_stops_retrying_and_says_manual(self):
+        old = free_server(47 * HOUR)
+
+        class CapApi(FakeApi):
+            def request(self, method, path, body=None, retries=2):
+                self.calls.append((method, path))
+                if method == "GET" and path == "/api/servers":
+                    return {"servers": [old]}, {}
+                raise vyce.ApiError(400, {"error": "captcha_required",
+                                          "message": "Please complete the CAPTCHA verification first."})
+
+        api = CapApi([[]])
+        failures, out = vyce_capture(api)
+        self.assertEqual(failures, 1)
+        self.assertIn("验证码", out)
+        self.assertIn("面板手动", out)
+
+
+def vyce_capture(api):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        failures = vyce.renew_once(api, {}, force=True)
+    return failures, buf.getvalue()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

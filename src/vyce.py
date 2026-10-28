@@ -405,6 +405,21 @@ def is_cooldown_error(status: int, msg: str) -> bool:
     ))
 
 
+def is_captcha_error(status: int, msg: str) -> bool:
+    """站点 2026-10 起给 /renew 加了 BestCap 人机校验（前端传 captchaResponse）。
+
+    命中的表现是 400/403 + captcha/verification 字样。这不是限流也不是冷却，
+    重试没有意义 —— 必须由人过验证码。
+    """
+    if status not in (400, 403, 422):
+        return False
+    low = str(msg).lower()
+    return any(p in low for p in (
+        "captcha", "captcha_required", "captcha_invalid", "verification",
+        "bestcap", "human",
+    ))
+
+
 def renew_once(api: Api, cfg: dict, force: bool = False, dry_run: bool = False) -> int:
     """检查并续期所有免费机。返回失败数量。"""
     servers = fetch_servers(api)
@@ -454,6 +469,13 @@ def renew_once(api: Api, cfg: dict, force: bool = False, dry_run: bool = False) 
             payload, _ = api.request("POST", f"/api/servers/{sid}/renew")
         except ApiError as exc:
             msg = str(exc)
+            if is_captcha_error(exc.status, msg) or (exc.status == 400 and "captcha" in msg.lower()):
+                warn("    续期已被站点验证码拦住（BestCap）：POST /renew 现在要求 captchaResponse，"
+                     "本工具无解，请到面板手动点 Renew")
+                state[sid] = {"name": name, "status": "captcha_required", "msg": msg,
+                              "last_check_ts": now_ms}
+                failures += 1
+                continue
             if is_cooldown_error(exc.status, msg):
                 m = re.search(r"wait\s+(\d+)\s+more\s+hour", msg, re.IGNORECASE)
                 wait_ms = int(m.group(1)) * HOUR_MS if m else st.get("cooldownLeft") or DAY_MS
@@ -583,6 +605,10 @@ def deploy(api: Api, cfg: dict, snap: dict, dry_run: bool,
             return None
         if exc.status == 409:
             warn(f"没抢到（{exc}）——名额已被别人拿走，继续监听")
+            return None
+        if is_captcha_error(exc.status, str(exc)) or (exc.status == 400 and "captcha" in str(exc).lower()):
+            warn(f"建机被验证码拦住（BestCap）：{exc} —— 站点开始给新建也加人机校验，"
+                 f"需人工到面板下单")
             return None
         if exc.status == 401:
             die("会话已失效，请重新导入 session.txt 里的 Cookie")
